@@ -2,3 +2,6 @@ google-cloud-aiplatform
 PyPDF2
 asyncio  # Built-in, but for clarity
 tenacity
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+python-dotenv==1.0.1

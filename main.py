@@ -8,13 +8,25 @@ import vertexai
 from utils import extract_text_from_pdf, chunk_text, extract_text_from_docx, extract_text
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable
+import warnings
+from dotenv import load_dotenv
+from fastapi import FastAPI
+from pydantic import BaseModel
+import uvicorn
+
+load_dotenv()
+warnings.filterwarnings("ignore")
+
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-001")
+PROJECT_ID = os.getenv("GCP_PROJECT_ID", "doclearn-470008")
+LOCATION = os.getenv("GCP_REGION", "us-central1")
 
 # Initialize Vertex AI
 def init_vertex_ai():
     try:
-        vertexai.init(project="doclearn-470008", location="us-central1")
+        vertexai.init(project="PROJECT_ID", location="LOCATION")
     except Exception:
-        vertexai.init(project="doclearn-470008", location="asia-east1")  # Fallback region
+        vertexai.init(project="PROJECT_ID", location="asia-east1")  # Fallback region
 
 init_vertex_ai()
 
@@ -23,7 +35,7 @@ init_vertex_ai()
     wait=wait_exponential(multiplier=1, min=1, max=10),
     retry=retry_if_exception_type((ResourceExhausted, ServiceUnavailable))
 )
-async def process_chunk(chunk, role, jurisdiction, model, output_file, is_final_pass=False, total_clauses=0):
+async def process_chunk(chunk, role, jurisdiction, model, is_final_pass=False, total_clauses=0):
     if is_final_pass and total_clauses > 50:
         prompt = (
             f"As a {role} in {jurisdiction}, extract concise numbered clauses from the legal text. Club short clauses under the same topic (e.g., liability, penalties, obligations) into a single clause with combined text. "
@@ -55,81 +67,64 @@ async def process_chunk(chunk, role, jurisdiction, model, output_file, is_final_
         cleaned_response = re.sub(r'```json\n|```|\n\s*\n', '', full_response).strip()
         try:
             clauses = json.loads(cleaned_response)
-            if not clauses:
-                with open(output_file, "a", encoding="utf-8") as f:
-                    f.write(json.dumps({"error": "No clauses found in chunk"}) + "\n")
-            else:
-                if is_final_pass:
-                    with open(output_file, "a", encoding="utf-8") as f:
-                        for clause in clauses:
-                            f.write(json.dumps(clause, ensure_ascii=False) + "\n")
             return clauses
         except json.JSONDecodeError:
             # Fallback: Write chunk as a single clause
-            fallback_clause = {
+            return[ {
                 "clause_number": "unknown",
                 "clause_text": chunk[:1000],  # Truncate for safety
                 "clause_risk": "medium",
                 "negotiation": "NIL"
-            }
-            if is_final_pass:
-                with open(output_file, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(fallback_clause, ensure_ascii=False) + "\n")
-            return [fallback_clause]
+            }]
+            
     except Exception as e:
-        if is_final_pass:
-            with open(output_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"error": f"Processing error: {str(e)}"}) + "\n")
-        return []
+        return [{"error": f"Processing error: {str(e)}"}]
 
-async def process_document(file_path, role, jurisdiction, chunk_size=1000):
-    model = GenerativeModel("gemini-2.0-flash-001")
-    output_file = r"E:\Courses\docLearn\backend\output.jsonl"  # Absolute path
-    with open(output_file, "w", encoding="utf-8") as f:
-        f.write("")
-    text = extract_text(file_path)
+async def process_document(extracted_json, role, jurisdiction, chunk_size=1000):
+    model = GenerativeModel(GEMINI_MODEL)
+    text = extracted_json.get("text", "")
     if not text:
-        with open(output_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"error": "No text extracted from document"}) + "\n")
-        return []
-    chunks = chunk_text(text, chunk_size)
+        return [{"error": "No text provided"}]
+
+    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
     all_clauses = []
-    # First pass: Collect all clauses
+
     for chunk in chunks:
-        clauses = await process_chunk(chunk, role, jurisdiction, model, output_file, is_final_pass=False)
+        clauses = await process_chunk(chunk, role, jurisdiction, model, is_final_pass=False)
         all_clauses.extend(clauses)
-    # Second pass: If >50 clauses, reprocess for very high risk negotiations
+
     total_clauses = len([c for c in all_clauses if "error" not in c])
     if total_clauses > 50:
-        with open(output_file, "w", encoding="utf-8") as f:
-            f.write("")  # Clear file for final output
         very_high_clauses = []
         for chunk in chunks:
-            clauses = await process_chunk(chunk, role, jurisdiction, model, output_file, is_final_pass=True, total_clauses=total_clauses)
+            clauses = await process_chunk(
+                chunk, role, jurisdiction, model,
+                is_final_pass=True, total_clauses=total_clauses
+            )
             very_high_clauses.extend([c for c in clauses if c.get("clause_risk") == "very high"])
-        # Sort by clause_number and take top 50 very high risk
+
         very_high_clauses = sorted(very_high_clauses, key=lambda x: x["clause_number"])[:50]
-        other_clauses = [c for c in all_clauses if c.get("clause_risk") != "very high" or c in very_high_clauses]
-        # Write all clauses to file
-        with open(output_file, "a", encoding="utf-8") as f:
-            for clause in other_clauses + very_high_clauses:
-                if "error" not in clause:
-                    f.write(json.dumps(clause, ensure_ascii=False) + "\n")
-    else:
-        with open(output_file, "a", encoding="utf-8") as f:
-            for clause in all_clauses:
-                if "error" not in clause:
-                    f.write(json.dumps(clause, ensure_ascii=False) + "\n")
+        other_clauses = [
+            c for c in all_clauses if c.get("clause_risk") != "very high" or c in very_high_clauses
+        ]
+        return other_clauses + very_high_clauses
+
     return all_clauses
 
-def main():
-    parser = argparse.ArgumentParser(description="Legal Document Analyzer")
-    parser.add_argument("--file", required=True, help="Path to PDF/Word file")
-    parser.add_argument("--jurisdiction", default="India", help="Jurisdiction (e.g., India)")
-    parser.add_argument("--role", default="client", help="User role (e.g., client/vendor/lawyer)")
-    args = parser.parse_args()
+app = FastAPI()
 
-    asyncio.run(process_document(args.file, args.role, args.jurisdiction))
+@app.get("/")
+def home():
+    return {"message": "Legal Negotiation Analyzer is running on Cloud Run 🚀"}
 
-if __name__ == "__main__":
-    main()
+class NegotiationInput(BaseModel):
+    role: str
+    jurisdiction: str
+    text: str
+
+@app.post("/analyze/")
+async def analyze(input: NegotiationInput):
+    result = await process_document(
+        {"text": input.text}, input.role, input.jurisdiction
+    )
+    return {"clauses": result}

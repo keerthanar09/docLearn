@@ -128,3 +128,7 @@ async def analyze(input: NegotiationInput):
         {"text": input.text}, input.role, input.jurisdiction
     )
     return {"clauses": result}
+
+import os, uvicorn
+port = int(os.environ.get("PORT", 8080))
+uvicorn.run(app, host="0.0.0.0", port=port)
